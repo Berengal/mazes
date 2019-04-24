@@ -16,11 +16,6 @@ import qualified Data.Array.IO as IOA
 
 import Data.Foldable
 
--- | 
-type GridNodes s a = STArray s GridCoord a
-type GridEdges s a = STArray s EdgeCoord a
-
-
 type GridCoord = (Int, Int)
 type GridBounds = (GridCoord, GridCoord)
 
@@ -48,12 +43,22 @@ edges (x, y) bounds = map snd . filter (inRange bounds . fst) $ ns
              , ((x, y+1), (x, y, Vert))
              ]
 
+
+
 unvisitedNeighbors :: _ => GridCoord -> _ -> _ [GridCoord]
 unvisitedNeighbors node visitedArr = do
   bounds <- getBounds visitedArr
   filterM (fmap not . readArray visitedArr) (neighbors node bounds)
 
---shuffle :: (MArray a e m, RandomGen g, _) => a i e -> g -> m ()
+
+shuffleList :: RandomGen g => [e] -> g -> ST s [e]
+shuffleList list g = do
+  let l = length list
+  arr <- newListArray (0, (l-1)) list :: ST s (STArray s Int _)
+  shuffle arr g
+  getElems arr
+
+shuffle :: (MArray a e m, RandomGen g, _) => a i e -> g -> m ()
 shuffle arr = evalRandT do
   let swap i j = do
         a <- readArray arr i
