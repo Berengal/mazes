@@ -1,2 +1,10 @@
+import Test.Hspec
+
+import qualified Maze.Generate.Worm.Spec
+
+
 main :: IO ()
-main = putStrLn "Test suite not yet implemented"
+main = hspec spec
+
+spec = do
+  describe "Maze.Generate.Worm.Spec" Maze.Generate.Worm.Spec.spec
