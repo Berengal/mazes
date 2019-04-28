@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE RankNTypes #-}
@@ -11,8 +12,8 @@
   --This algorithm works by having worms dig out a maze in a random fashion. As
   --the worms burrow through the region they have a random chance to turn, spawn
   --new worms, and if they're at a dead end, to tunnel through the wall in front
-  --of them. The walls and empty tiles in the final maze are only 1 tile wide
-  --with no larger open rooms or columns.
+  --of them. The walls and empty tiles in the final maze are mostly 1 tile wide
+  --with as few larger open rooms or columns as possible.
   --
   --All empty tiles created by any single worm or its spawn are connected in the
   --final maze. If there are multiple worms to start with the separate parts of
@@ -52,7 +53,7 @@
 
 module Maze.Generate.Worm
   ( -- * Data types
-    BurrowState(..)
+    BurrowConfig(..)
   , Grid
   , IGrid
   , Worm
@@ -64,10 +65,11 @@ module Maze.Generate.Worm
   , GridBounds
 
   -- * Algorithm
-  , defaultBurrowState
+  , defaultBurrowConfig
   , newGrid
 
   , runDefaultBurrow
+  , runWithRandomWorm
   , runBurrow
 
   -- * Utility functions
@@ -104,17 +106,27 @@ import qualified Data.Text.Lazy.Builder as TB
 
 import qualified Data.Text.Lazy.IO as LTIO
 
--- | The BurrowState contains the state used for running the algorithm
+-- data BurrowConfig = BurrowConfig
+--   { gridSize :: (Int, Int)
+--   , worms :: S.Set Worm
+--   , breachWallChance :: Double
+--   , turnChance :: Double
+--   , spawnChance :: Doubl
+--   }
 
-data BurrowState s =
-  BS { grid :: Grid s -- ^ The maze grid
-     , worms :: S.Set Worm -- ^ The set of active worms on the grid
-     , breachWallChance :: Double -- ^ Chance that a worm will breach a wall
-                           -- (between 0 and 1)
-     , turnChance :: Double -- ^ Chance that a worm won't just continue straight
-                     -- ahead at every tile
-     , spawnChance :: Double -- ^ Chance to spawn a new worm at every tile
-     }
+-- | The 'BurrowConfig' contains the state used for running the algorithm
+
+data BurrowConfig = BurrowConfig
+  { gridSize :: (Int, Int) -- ^ The internal size of the grid
+     
+--     , grid :: Grid s -- ^ The maze grid  
+  , worms :: S.Set Worm -- ^ The set of active worms on the grid
+  , breachWallChance :: Double -- ^ Chance that a worm will breach a wall
+                               -- (between 0 and 1)
+  , turnChance :: Double -- ^ Chance that a worm won't just continue straight
+                         -- ahead at every tile
+  , spawnChance :: Double -- ^ Chance to spawn a new worm at every tile
+  }
 
 -- | Array of tiles representing a 2d maze grid
 type Grid s = STArray s GridCoord Tile
@@ -168,14 +180,13 @@ data TileAnnotation
 type GridCoord = (Int, Int)
 type GridBounds = (GridCoord, GridCoord)
 
--- | Creates a `BurrowState` with a grid of the given internal size and using
+-- | Creates a `BurrowConfig` with a grid of the given internal size and using
 -- default weights. The grid will have two extra rows and columns to provide
 -- edge tiles.
-defaultBurrowState :: (Int, Int) -> ST s (BurrowState s)
-defaultBurrowState size = do
-  grid <- newGrid size
-  return BS {..}
-  where worms = S.empty
+defaultBurrowConfig :: (Int, Int) -> BurrowConfig
+defaultBurrowConfig size = BurrowConfig {..}
+  where gridSize = size
+        worms = S.empty
         breachWallChance = 0.03
         turnChance = 0.70
         spawnChance = 0.20
@@ -254,11 +265,17 @@ newGrid (x, y) = do
 -- * Neighboring dirt tiles are checked to avoid creating either a 2x2 empty
 --room or a 2x2 wall square. If the neighboring tile has 3 empty neighbors in
 --turn it is marked `Solid`, and if it has 3 neighboring `Wall`s or `Solid`
---tiles it remains dirt. Otherwise neighboring dirt tiles are marked `Wall`
+--tiles it remains dirt. Otherwise neighboring dirt tiles are marked
+--`Wall`. Note that this does not guarantee that there won't ever be a 2x2
+--square created
 --
 --Finally the updated set of worms is returned
-step :: forall s g. (RandomGen g) => g -> BurrowState s -> ST s (Maybe (S.Set Worm))
-step g BS{..} =
+step :: forall s g. (RandomGen g)
+     => g
+     -> BurrowConfig
+     -> Grid s
+     -> ST s (Maybe (S.Set Worm))
+step g BurrowConfig{..} grid =
   if S.null worms then
     return Nothing
   else do
@@ -270,9 +287,9 @@ step g BS{..} =
       Wall    -> if not (breachWall breachWallChance dieG) then
                    return deadWormSet
                  else
-                   getDirtDirections >>= updateGrid
+                    getDirtDirections grid newPos >>= updateGrid
 
-      Dirt    -> getDirtDirections >>= updateGrid
+      Dirt    -> getDirtDirections grid newPos >>= updateGrid
     
   where wormG:dieG:turnG:spawnG:_ = splits g
   
@@ -282,15 +299,6 @@ step g BS{..} =
         deadWormSet = Just noWormSet
         
         newPos@(Pos (x, y)) = moveInDir oldPos oldDir -- TODO bounds checking?
-
-        getDirtDirections :: ST s [Direction]
-        getDirtDirections = do
-          neighborTiles <- mapM (readArray grid . unPos) (neighbors newPos)
-          let dirtDirections = map (direction newPos . fst)
-                               . filter ((==Dirt).snd)
-                               . zip (neighbors newPos)
-                               $ neighborTiles
-          return dirtDirections
 
         updateGrid :: [Direction] -> ST s (Maybe (S.Set Worm))
         updateGrid dirtDirections = do
@@ -320,63 +328,90 @@ step g BS{..} =
                                Nothing -> movedWormSet
                                Just w -> S.insert w movedWormSet
 
--- | Fills the tile at the given `Position` (assumed to already be `Dirt`) while
--- avoiding 2x2 square of either `Empty` tiles or `Wall`/`Solid` tiles.
+-- | The list of 'Direction's that point to tiles with 'Dirt' from the given 'Position'
+getDirtDirections :: Grid s -> Position -> ST s [Direction]
+getDirtDirections grid pos = do
+  neighborTiles <- mapM (readArray grid . unPos) (neighbors pos)
+  let dirtDirections = map (direction pos . fst)
+                       . filter ((==Dirt).snd)
+                       . zip (neighbors pos)
+                       $ neighborTiles
+  return dirtDirections
+
+
+-- | Fills the 'Tile' at the given 'Position' (assumed to already be 'Dirt') while
+-- avoiding 2x2 square of either 'Empty' tiles or 'Wall'/'Solid' tiles.
 --
---If it has 3 neighboring `Empty` tiles it's marked `Solid`, if it was 3
--- neighboring `Wall`/`Solid` tiles it's marked `Dirt` (which is should already
--- be), otherwise it's marked `Wall`
-fillAvoidingSquare :: STArray s (Int, Int) Tile -> Position -> ST s ()
+-- If the tile wasn't marked to avoid a square it is marked as 'Wall'
+-- 
+-- There is still a chance 2x2 squares can appear
+fillAvoidingSquare :: Grid s -> Position -> ST s ()
 fillAvoidingSquare grid pos = do
-  avoidedSquares <- forM (squaresWith pos) $ \square -> do
-    -- Look for 3 tiles in a square that are either Empty or Wall/Solid
-    squareTiles <- map (\(t:_) -> if t then Empty else Wall)
-                   . filter ((==3).length)
-                   . group
-                   . sort
-                   . map (==Empty)
-                   . filter (/=Dirt)
-                   <$> mapM (readArray grid . unPos) square
-    forM_ squareTiles \(tile) ->
-      case tile of
-        Empty -> writeArray grid (unPos pos) (Solid Internal)
-        Wall  -> writeArray grid (unPos pos) Dirt --Should already be dirt
-        _     -> return ()
-    return (not (null squareTiles))
-  if or avoidedSquares then return ()
+  avoidedSquares <- avoidSquare grid pos
+  if avoidedSquares then return ()
     else writeArray grid (unPos pos) Wall
+
+-- | Avoids 2x2 squares of a single 'Tile' type by checking the squares the given
+-- 'Position' is a part of if they either contain 3 'Empty' tiles or 3
+-- 'Wall'/'Solid' tiles already. The tile at the given position is assumed to be
+-- 'Dirt'
+--
+-- If it has 3 neighboring 'Empty' tiles it's marked 'Solid', if it was 3
+-- neighboring 'Wall'/'Solid' tiles it's marked 'Dirt'
+avoidSquare :: Grid s -> Position -> ST s Bool
+avoidSquare grid pos =
+  or <$> forM (squaresWith pos) \square -> do
+  squareTiles <- map (\(t:_) -> if t then Empty else Wall)
+                 . filter ((==3).length)
+                 . group
+                 . sort
+                 . map (==Empty)
+                 . filter (/=Dirt)
+                 <$> mapM (readArray grid . unPos) square
+  forM_ squareTiles $ \case
+    Empty -> writeArray grid (unPos pos) (Solid Internal)
+    Wall  -> writeArray grid (unPos pos) Dirt -- Should already be Dirt
+    _     -> return ()
+  return . not . null $ squareTiles
 
 -- | Given the initial state, runs the burrow algorithm and returns the
 -- generated maze
 
--- TODO Get rid of the ST argument and use some other representation of the
--- initial grid
 runBurrow :: (RandomGen g)
           => g
-          -> (forall s. ST s (BurrowState s)) -- ^
+          -> BurrowConfig
           -> IGrid
-runBurrow g getBs = runST $ do
-  bs <- getBs
-  doBurrow g bs
-  freeze (grid bs)
+runBurrow g conf = runST $ do
+  grid <- newGrid (gridSize conf)
+  doBurrow g conf grid
+  freeze grid
 
 -- | Runs the burrow algorithm with default parameters on a grid of size (x,y)
 runDefaultBurrow :: (RandomGen g) => g -> (Int, Int) -> IGrid
-runDefaultBurrow g (x, y) = runBurrow g1 getBs
+runDefaultBurrow g (x, y) = runBurrow g1 conf
   where
     (g1:g2:_) = splits g
-    getBs = do
-      bs <- defaultBurrowState (x, y)
-      return bs{worms= S.singleton (randomWorm g2 ( (1, 1)
-                                                  , (x , y)))}
+    worm = randomWorm g2 ((1, 1), (x , y))
+    conf = (defaultBurrowConfig (x, y))
+           {worms = S.singleton worm}
+
+-- | Runs the burrow algorithm with a single random worm
+runWithRandomWorm :: (RandomGen g)
+                  => g
+                  -> BurrowConfig
+                  -> IGrid
+runWithRandomWorm g conf =
+  let (g1, g2) = split g
+      worm = randomWorm g1 ((1, 1), gridSize conf)
+  in runBurrow g2 conf{worms = S.singleton worm}
 
 -- | Loops the steps until the algorithm is done
-doBurrow :: (RandomGen g) => g -> BurrowState s -> ST s ()
-doBurrow g bs = do
-  newWorms <- step g1 bs
+doBurrow :: (RandomGen g) => g -> BurrowConfig -> Grid s -> ST s ()
+doBurrow g conf grid = do
+  newWorms <- step g1 conf grid
   case newWorms of
     Nothing -> return ()
-    Just nw -> doBurrow g2 bs{worms = nw}
+    Just nw -> doBurrow g2 conf{worms = nw} grid
   where
     (g1:g2:_) = splits g
 
