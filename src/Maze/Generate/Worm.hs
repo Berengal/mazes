@@ -106,14 +106,6 @@ import qualified Data.Text.Lazy.Builder as TB
 
 import qualified Data.Text.Lazy.IO as LTIO
 
--- data BurrowConfig = BurrowConfig
---   { gridSize :: (Int, Int)
---   , worms :: S.Set Worm
---   , breachWallChance :: Double
---   , turnChance :: Double
---   , spawnChance :: Doubl
---   }
-
 -- | The 'BurrowConfig' contains the state used for running the algorithm
 
 data BurrowConfig = BurrowConfig
@@ -121,6 +113,13 @@ data BurrowConfig = BurrowConfig
      
 --     , grid :: Grid s -- ^ The maze grid  
   , worms :: S.Set Worm -- ^ The set of active worms on the grid
+  , avoidSquares :: Bool -- ^ Use extra logic to avoid 2x2 squares
+  , respawnWorms :: Bool -- ^ Spawn new worms if there still dirt tiles with no
+                   -- live worms
+  , fillLeftoverDirt :: Bool -- ^ Turn any dirt tiles into walls after the
+                        -- algorithm is done
+  , randomWormSelection :: Bool -- ^ Select a new random worm after each
+                           -- generation step
   , breachWallChance :: Double -- ^ Chance that a worm will breach a wall
                                -- (between 0 and 1)
   , turnChance :: Double -- ^ Chance that a worm won't just continue straight
@@ -133,9 +132,13 @@ type Grid s = STArray s GridCoord Tile
 -- | Immutable maze grid
 type IGrid = Array GridCoord Tile
 
--- | Worms burrow through the maze. Each has a position and a direction
-data Worm = Worm Position Direction
-  deriving (Eq, Ord, Show)
+-- | Worms burrow through the maze. Each has a priority, a position and a direction
+data Worm = Worm Int Position Direction
+  deriving (Eq, Show)
+
+instance Ord Worm where
+  compare (Worm pri1 pos1 dir1) (Worm pri2 pos2 dir2)
+    = compare pri1 pri2 <> compare pos1 pos2 <> compare dir1 dir2
 
 -- | Position of worms and tiles in the maze. (0,0) is at the top left
 -- corner. The x axis grows to the right and the y axis grows downwards.
@@ -190,6 +193,10 @@ defaultBurrowConfig size = BurrowConfig {..}
         breachWallChance = 0.03
         turnChance = 0.70
         spawnChance = 0.20
+        avoidSquares = True
+        respawnWorms = True
+        fillLeftoverDirt = True
+        randomWormSelection = True
 
 -- Predicate determining if a wall should be breached
 breachWall :: (RandomGen g)
@@ -224,13 +231,14 @@ turn turnChance g currentDir preferedDirs
 spawnWorm :: (RandomGen g)
           => Double -- ^ Spawn chance
           -> g -- ^ RNG
+          -> Int -- ^ Priority
           -> Position -- ^ Spawn position
           -> [Direction] -- ^ Possible spawn directions
           -> Maybe Worm -- ^ Spawned worm (or not)
-spawnWorm spawnChance g pos dirs =
+spawnWorm spawnChance g pri pos dirs =
   let (r, g1) = random g
   in if not (null dirs) && r < spawnChance then
-       Just (Worm pos (chooseL g1 dirs))
+       Just (Worm pri pos (chooseL g1 dirs))
      else
        Nothing
 
@@ -276,25 +284,35 @@ step :: forall s g. (RandomGen g)
      -> Grid s
      -> ST s (Maybe (S.Set Worm))
 step g BurrowConfig{..} grid =
-  if S.null worms then
-    return Nothing
-  else do
-    tile <- getTileInFront oldWorm grid
-    case tile of
-      Solid _ -> return deadWormSet
-      Empty   -> return deadWormSet
+  if | S.null worms && respawnWorms -> do
+         worm <- randomWorm g <$> getPossibleWormParameters grid
+         case worm of
+           Nothing -> return Nothing
+           Just w@(Worm _ (Pos pos) _) -> do
+             writeArray grid pos Empty
+             return $ Just (S.singleton w)
+             
+     | S.null worms && not respawnWorms ->
+         return Nothing
+         
+     | otherwise -> do
+         tile <- getTileInFront oldWorm grid
+         case tile of
+           Solid _ -> return deadWormSet
+           Empty   -> return deadWormSet
 
-      Wall    -> if not (breachWall breachWallChance dieG) then
-                   return deadWormSet
-                 else
-                    getDirtDirections grid newPos >>= updateGrid
+           Wall    -> if not (breachWall breachWallChance dieG) then
+                        return deadWormSet
+                      else
+                        getDirtDirections grid newPos >>= updateGrid
 
-      Dirt    -> getDirtDirections grid newPos >>= updateGrid
+           Dirt    -> getDirtDirections grid newPos >>= updateGrid
     
   where wormG:dieG:turnG:spawnG:_ = splits g
   
-        wormIx = fst $ randomR (0, S.size worms - 1) wormG
-        oldWorm@(Worm oldPos oldDir) = S.elemAt wormIx worms
+        wormIx | randomWormSelection = fst $ randomR (0, S.size worms - 1) wormG
+               | otherwise = 0
+        oldWorm@(Worm pri oldPos oldDir) = S.elemAt wormIx worms
         noWormSet = worms \\ S.singleton oldWorm
         deadWormSet = Just noWormSet
         
@@ -308,18 +326,21 @@ step g BurrowConfig{..} grid =
                     || maybe False (flip isTileInFrontOf neighbor) spawnedWorm) $ do
               tile <- readArray grid (unPos neighbor)
               case tile of
-                Dirt -> fillAvoidingSquare grid neighbor
+                Dirt -> if avoidSquares then
+                          fillAvoidingSquare grid neighbor
+                        else
+                          fillSquare grid neighbor
                 _    -> return ()
-              
           return spawnedWormSet
           
           where
             preferedDirs = if null dirtDirections then directions else dirtDirections
             newDir = turn turnChance turnG oldDir preferedDirs
-            newWorm = Worm newPos newDir
+            newWorm = Worm pri newPos newDir
             spawnedWorm = spawnWorm
                           spawnChance
                           wormG
+                          (S.size worms)
                           newPos
                           (filter (/= newDir) preferedDirs)
         
@@ -349,7 +370,10 @@ fillAvoidingSquare :: Grid s -> Position -> ST s ()
 fillAvoidingSquare grid pos = do
   avoidedSquares <- avoidSquare grid pos
   if avoidedSquares then return ()
-    else writeArray grid (unPos pos) Wall
+    else fillSquare grid pos
+
+fillSquare :: Grid s -> Position -> ST s ()
+fillSquare grid pos = writeArray grid (unPos pos) Wall
 
 -- | Avoids 2x2 squares of a single 'Tile' type by checking the squares the given
 -- 'Position' is a part of if they either contain 3 'Empty' tiles or 3
@@ -374,6 +398,35 @@ avoidSquare grid pos =
     _     -> return ()
   return . not . null $ squareTiles
 
+-- | Return all the position of all the dirt tiles in the grid
+getDirtTiles :: Grid s -> ST s [Position]
+getDirtTiles grid = do
+  ps <- range <$> getBounds grid
+  map Pos <$> filterM (\p -> (==Dirt) <$> readArray grid p) ps
+
+-- | Returns all the neighbors that match the given predicate. Position must not
+-- be an edge position
+getNeighborsOfType :: Grid s -> Position -> (Tile -> Bool) -> ST s [Position]
+getNeighborsOfType grid pos p = map Pos <$> filterM isType nbs
+  where isType t = p <$> readArray grid t
+        nbs = map unPos $ neighbors pos
+
+getPositionsPointingTo grid tiles p
+  = concat <$> forM tiles \t -> do
+  nbs <- getNeighborsOfType grid t p
+  return [(n, direction n t) | n <- nbs]
+
+-- | Returns all wall tiles that neighbors a dirt tile and the direction of the
+-- dirt tile it neighbors. Can return multiple entries for the same position.
+getPossibleWormParameters :: Grid s -> ST s [(Position, Direction)]
+getPossibleWormParameters grid = do
+  dirtTiles <- getDirtTiles grid
+  empties <- getPositionsPointingTo grid dirtTiles (==Empty)
+  if not (null empties) then
+    return empties
+    else getPositionsPointingTo grid dirtTiles (==Wall)
+    
+
 -- | Given the initial state, runs the burrow algorithm and returns the
 -- generated maze
 
@@ -388,12 +441,8 @@ runBurrow g conf = runST $ do
 
 -- | Runs the burrow algorithm with default parameters on a grid of size (x,y)
 runDefaultBurrow :: (RandomGen g) => g -> (Int, Int) -> IGrid
-runDefaultBurrow g (x, y) = runBurrow g1 conf
-  where
-    (g1:g2:_) = splits g
-    worm = randomWorm g2 ((1, 1), (x , y))
-    conf = (defaultBurrowConfig (x, y))
-           {worms = S.singleton worm}
+runDefaultBurrow g size
+  = runWithRandomWorm g (defaultBurrowConfig size)
 
 -- | Runs the burrow algorithm with a single random worm
 runWithRandomWorm :: (RandomGen g)
@@ -402,7 +451,7 @@ runWithRandomWorm :: (RandomGen g)
                   -> IGrid
 runWithRandomWorm g conf =
   let (g1, g2) = split g
-      worm = randomWorm g1 ((1, 1), gridSize conf)
+      Just worm = randomWormInBounds g1 ((1, 1), gridSize conf)
   in runBurrow g2 conf{worms = S.singleton worm}
 
 -- | Loops the steps until the algorithm is done
@@ -410,27 +459,33 @@ doBurrow :: (RandomGen g) => g -> BurrowConfig -> Grid s -> ST s ()
 doBurrow g conf grid = do
   newWorms <- step g1 conf grid
   case newWorms of
-    Nothing -> return ()
     Just nw -> doBurrow g2 conf{worms = nw} grid
+    Nothing -> if fillLeftoverDirt conf
+               then map unPos <$> getDirtTiles grid
+                    >>= mapM_ (\p -> writeArray grid p Wall)
+               else return ()
   where
     (g1:g2:_) = splits g
 
 -- | Creates a random worm within the given grid bounds
-randomWorm :: (RandomGen g) => g -> GridBounds -> Worm
-randomWorm g ((lowX, lowY), (highX, highY))
-  = Worm (Pos (fst (randomR (lowX, highX) g1)
-              ,fst (randomR (lowY, highY) g2)))
-         (chooseL g3 directions)
-  where (g1:g2:g3:_) = splits g
+randomWormInBounds :: (RandomGen g) => g -> GridBounds -> Maybe Worm
+randomWormInBounds g bnds = randomWorm g
+                            [ (Pos pos, dir)
+                            | pos <- range bnds
+                            , dir <- directions]
+
+randomWorm :: RandomGen g => g -> [(Position, Direction)] -> Maybe Worm
+randomWorm _ [] = Nothing
+randomWorm g opts = Just . uncurry (Worm 0) . chooseL g $ opts
 
 -- | Determines if the position is directly in front of the worm
 isTileInFrontOf :: Worm -> Position -> Bool
-isTileInFrontOf (Worm wormPos wormDir) pos
+isTileInFrontOf (Worm _ wormPos wormDir) pos
   = pos == moveInDir wormPos wormDir
 
 -- | Looks up the tile in front of the worm
 getTileInFront :: Worm -> STArray s (Int, Int) Tile -> ST s Tile
-getTileInFront (Worm pos dir) grid = do
+getTileInFront (Worm _ pos dir) grid = do
   bounds <- getBounds grid
   let (Pos (x, y)) = moveInDir pos dir
   readArray grid (x, y)
