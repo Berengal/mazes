@@ -86,104 +86,21 @@ module Maze.Generate.Worm
 
 where
 
+import Maze.Generate.Worm.Internal
+
 import System.Random
 
 import Control.Monad
 import Control.Monad.ST
+
+import Data.Array.ST
+import Data.Array.IArray
 
 import qualified Data.Set as S
 import Data.Set ((\\))
 import Data.List (sort, group)
 
 import Data.Maybe
-
-import Data.Array.ST
-import Data.Array.IArray
-
-import qualified Data.Text as T
-import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.Builder as TB
-
-import qualified Data.Text.Lazy.IO as LTIO
-
--- | The 'BurrowConfig' contains the state used for running the algorithm
-
-data BurrowConfig = BurrowConfig
-  { gridSize :: (Int, Int) -- ^ The internal size of the grid
-     
---     , grid :: Grid s -- ^ The maze grid  
-  , worms :: S.Set Worm -- ^ The set of active worms on the grid
-  , avoidSquares :: Bool -- ^ Use extra logic to avoid 2x2 squares
-  , respawnWorms :: Bool -- ^ Spawn new worms if there still dirt tiles with no
-                   -- live worms
-  , fillLeftoverDirt :: Bool -- ^ Turn any dirt tiles into walls after the
-                        -- algorithm is done
-  , randomWormSelection :: Bool -- ^ Select a new random worm after each
-                           -- generation step
-  , breachWallChance :: Double -- ^ Chance that a worm will breach a wall
-                               -- (between 0 and 1)
-  , turnChance :: Double -- ^ Chance that a worm won't just continue straight
-                         -- ahead at every tile
-  , spawnChance :: Double -- ^ Chance to spawn a new worm at every tile
-  }
-
--- | Array of tiles representing a 2d maze grid
-type Grid s = STArray s GridCoord Tile
--- | Immutable maze grid
-type IGrid = Array GridCoord Tile
-
--- | Worms burrow through the maze. Each has a priority, a position and a direction
-data Worm = Worm Int Position Direction
-  deriving (Eq, Show)
-
-instance Ord Worm where
-  compare (Worm pri1 pos1 dir1) (Worm pri2 pos2 dir2)
-    =  compare pri1 pri2
-    <> compare pos1 pos2
-    <> compare dir1 dir2
-
--- | Position of worms and tiles in the maze. (0,0) is at the top left
--- corner. The x axis grows to the right and the y axis grows downwards.
-newtype Position = Pos (Int, Int)
-  deriving (Eq, Ord, Show)
-
-unPos :: Position -> (Int, Int)
-unPos (Pos c) = c
-
--- | One of the four compas directions. In a (x, y) coordinate system, going
--- `South` means increasing y component, going `East` means increasing x
--- component, `North` and `East` go the opposite ways respectively.
-data Direction
-  = North
-  | East
-  | South
-  | West
-  deriving (Show, Eq, Ord, Enum, Bounded)
-
--- | Grid tiles
-data Tile
-  = Dirt -- ^ `Dirt` tiles are unvisited by any worms
-  | Empty -- ^ `Empty` tiles have been excavated by a `Worm`. An `Empty` tile
-    -- encountered by a worm will kill it.
-  | Wall -- ^ `Wall` tiles are created next to `Empty` tiles created by a
-    -- `Worm`. There is a chance a worm could burrow through it, but if not
-    -- running into one will kill the `Worm`
-  | Solid TileAnnotation -- ^ `Solid` tiles will always remain `Solid`. Running
-    -- into one will kill a `Worm`
-  deriving (Show, Eq, Ord)
-
--- | Annotations on `Solid` tiles. Solid tiles marked `Entry` or `Exit` will
--- guaranteed be connected to an `Empty` tile
-data TileAnnotation
-  = Edge -- ^ The solid tiles around the edge of the grid should be marked `Edge`
-  | Internal -- ^ Tiles marked `Internal` are inside the grid, unlike `Edge` tiles
-  | Entry -- ^ A maze entrance tile
-  | Exit -- ^ A maze exit tile
-  deriving (Show, Eq, Ord)
-
-
-type GridCoord = (Int, Int)
-type GridBounds = (GridCoord, GridCoord)
 
 -- | Creates a `BurrowConfig` with a grid of the given internal size and using
 -- default weights. The grid will have two extra rows and columns to provide
@@ -287,28 +204,30 @@ step :: forall s g. (RandomGen g)
      -> ST s (Maybe (S.Set Worm))
 step g BurrowConfig{..} grid =
   if | S.null worms && respawnWorms -> do
-         worm <- randomWorm g <$> getPossibleWormParameters grid
-         case worm of
+         (min, max) <- getBounds grid
+         let startPos = fst $ randomR (Pos min, Pos max) g
+         wormParams <- getNewWormParameters grid (startPos)
+         case wormParams of
            Nothing -> return Nothing
-           Just w@(Worm _ (Pos pos) _) -> do
-             writeArray grid pos Empty
-             return $ Just (S.singleton w)
+           Just (pos, dir) -> do
+             writeArray grid (unPos pos) Empty
+             return $ Just (S.singleton (Worm 0 pos dir))
              
      | S.null worms && not respawnWorms ->
          return Nothing
          
      | otherwise -> do
-         tile <- getTileInFront oldWorm grid
+         tile <- getTileInFront grid oldWorm
          case tile of
            Solid _ -> return deadWormSet
            Empty   -> return deadWormSet
 
            Wall    -> if not (breachWall breachWallChance dieG) then
                         return deadWormSet
-                      else
-                        getDirtDirections grid newPos >>= updateGrid
+                      else moveWorm
 
-           Dirt    -> getDirtDirections grid newPos >>= updateGrid
+           Dirt    -> moveWorm
+                                       
     
   where wormG:dieG:turnG:spawnG:_ = splits g
   
@@ -322,8 +241,12 @@ step g BurrowConfig{..} grid =
         
         newPos@(Pos (x, y)) = moveInDir oldPos oldDir -- TODO bounds checking?
 
-        updateGrid :: [Direction] -> ST s (Maybe (S.Set Worm))
-        updateGrid dirtDirections = do
+        moveWorm = do dirtDirections <- getDirtDirections grid newPos
+                      tileInFront <- getTileInFront grid (Worm 0 newPos oldDir)
+                      updateGrid dirtDirections tileInFront
+
+        updateGrid :: [Direction] -> Tile -> ST s (Maybe (S.Set Worm))
+        updateGrid dirtDirections tileInFront = do
           writeArray grid (x, y) Empty
           forM_ (neighbors newPos) \neighbor ->
             unless (isTileInFrontOf newWorm neighbor
@@ -339,7 +262,7 @@ step g BurrowConfig{..} grid =
           
           where
             preferedDirs = if null dirtDirections then directions else dirtDirections
-            newDir = turn turnChance turnG oldDir preferedDirs
+            newDir = turn (if tileInFront == Dirt then turnChance else 1) turnG oldDir preferedDirs
             newWorm = Worm pri newPos newDir
             spawnedWorm = spawnWorm
                           spawnChance
@@ -376,6 +299,7 @@ fillAvoidingSquare grid pos = do
   if avoidedSquares then return ()
     else fillSquare grid pos
 
+-- | Marks the position as a 'Wall'
 fillSquare :: Grid s -> Position -> ST s ()
 fillSquare grid pos = writeArray grid (unPos pos) Wall
 
@@ -385,7 +309,7 @@ fillSquare grid pos = writeArray grid (unPos pos) Wall
 -- 'Dirt'
 --
 -- If it has 3 neighboring 'Empty' tiles it's marked 'Solid', if it was 3
--- neighboring 'Wall'/'Solid' tiles it's marked 'Dirt'
+-- neighboring 'Wall'/'Solid' tiles it's marked 'Empty'
 avoidSquare :: Grid s -> Position -> ST s Bool
 avoidSquare grid pos =
   or <$> forM (squaresWith pos) \square -> do
@@ -398,15 +322,15 @@ avoidSquare grid pos =
                  <$> mapM (readArray grid . unPos) square
   forM_ squareTiles $ \case
     Empty -> writeArray grid (unPos pos) (Solid Internal)
-    Wall  -> writeArray grid (unPos pos) Dirt -- Should already be Dirt
+    Wall  -> writeArray grid (unPos pos) Empty
     _     -> return ()
   return . not . null $ squareTiles
 
--- | Return all the position of all the dirt tiles in the grid
-getDirtTiles :: Grid s -> ST s [Position]
-getDirtTiles grid = do
+-- | Returns the position of all 'Tile's that match the given predicate
+getTilesOfType :: Grid s -> (Tile -> Bool) -> ST s [Position]
+getTilesOfType grid p = do
   ps <- range <$> getBounds grid
-  map Pos <$> filterM (\p -> (==Dirt) <$> readArray grid p) ps
+  map Pos <$> filterM (\t -> p <$> readArray grid t) ps
 
 -- | Returns all the neighbors that match the given predicate. Position must not
 -- be an edge position
@@ -415,21 +339,35 @@ getNeighborsOfType grid pos p = map Pos <$> filterM isType nbs
   where isType t = p <$> readArray grid t
         nbs = map unPos $ neighbors pos
 
-getPositionsPointingTo grid tiles p
-  = concat <$> forM tiles \t -> do
-  nbs <- getNeighborsOfType grid t p
-  return [(n, direction n t) | n <- nbs]
+-- | Returns all the neighbors of the given 'Position' that match the given
+-- predicate, as well as the direction from the neighbor to the given position
+-- (i.e. @moveDir neighbor direction == position@)
+getNeighborsPointingTo :: Grid s
+                       -> Position
+                       -> (Tile -> Bool)
+                       -> ST s [(Position, Direction)]
+getNeighborsPointingTo grid tile p = do
+  nbs <- getNeighborsOfType grid tile p
+  return [(n, direction n tile) | n <- nbs]
 
--- | Returns all wall tiles that neighbors a dirt tile and the direction of the
--- dirt tile it neighbors. Can return multiple entries for the same position.
-getPossibleWormParameters :: Grid s -> ST s [(Position, Direction)]
-getPossibleWormParameters grid = do
-  dirtTiles <- getDirtTiles grid
-  empties <- getPositionsPointingTo grid dirtTiles (==Empty)
-  if not (null empties) then
-    return empties
-    else getPositionsPointingTo grid dirtTiles (==Wall)
-    
+-- | Returns the parameters for a new worm starting at either an empty tile or
+-- a wall tile and looking at a dirt tile.
+getNewWormParameters :: Grid s -> Position -> ST s (Maybe (Position, Direction))
+getNewWormParameters grid start = do
+  bnds <- getBounds grid
+  go (spiral start bnds)
+  where
+    go [] = return Nothing
+    go (pos:ps) = do
+      t <- readArray grid (unPos pos)
+      if t /= Dirt then
+        go ps
+        else do
+        goodTile <- listToMaybe <$> getNeighborsPointingTo grid pos
+                    ((||) <$> (==Wall) <*> (==Empty))
+        if isNothing goodTile then
+          go ps
+          else return goodTile
 
 -- | Given the initial state, runs the burrow algorithm and returns the
 -- generated maze
@@ -465,7 +403,7 @@ doBurrow g conf grid = do
   case newWorms of
     Just nw -> doBurrow g2 conf{worms = nw} grid
     Nothing -> if fillLeftoverDirt conf
-               then map unPos <$> getDirtTiles grid
+               then map unPos <$> getTilesOfType grid (==Dirt)
                     >>= mapM_ (\p -> writeArray grid p Wall)
                else return ()
   where
@@ -488,87 +426,8 @@ isTileInFrontOf (Worm _ wormPos wormDir) pos
   = pos == moveInDir wormPos wormDir
 
 -- | Looks up the tile in front of the worm
-getTileInFront :: Worm -> STArray s (Int, Int) Tile -> ST s Tile
-getTileInFront (Worm _ pos dir) grid = do
+getTileInFront :: Grid s -> Worm -> ST s Tile
+getTileInFront grid (Worm _ pos dir) = do
   bounds <- getBounds grid
   let (Pos (x, y)) = moveInDir pos dir
   readArray grid (x, y)
-
--- | Maps directions to their opposites
-opposite :: Direction -> Direction
-opposite North = South
-opposite South = North
-opposite East = West
-opposite West = East
-
--- | List of all directions
-directions :: [Direction]
-directions = [North, South, East, West]
-
--- | List of all neighboring positions. Does not include diagonal neigbors
-neighbors :: Position -> [Position]
-neighbors (Pos (x, y)) =
-  [ Pos (x-1, y)
-  , Pos (x+1, y)
-  , Pos (x, y-1)
-  , Pos (x, y+1)
-  ]
-
--- | Direction from a given position to another position. Only well defined for
--- positions on the same horizontal or vertical position.
-direction :: Position -- ^ from
-          -> Position -- ^ to
-          -> Direction
-direction (Pos (x1, y1)) (Pos (x2, y2))
-  | x1 > x2 = West
-  | x2 > x1 = East
-  | y1 > y2 = South
-  | y2 > y1 = North
-
--- | The four positions forming the square with the given 'Position' in the
--- upper left corner (i.e. the "lowest" positon)
-squareAt :: Position -> [Position]
-squareAt (Pos (x,y)) = [Pos (x+dx, y+dy) | dx <- [0,1], dy <- [0,1]]
-
--- | All four squares that contain the given 'Position'
-squaresWith :: Position -> [[Position]]
-squaresWith (Pos (x,y)) = map squareAt . squareAt $ Pos (x-1, y-1)
-
--- | The position you get to if you move one step from the given 'Position' in
--- the given 'Direction'
-moveInDir :: Position -> Direction -> Position
-moveInDir (Pos (x, y)) dir = case dir of
-  North -> Pos (x, y+1)
-  South -> Pos (x, y-1)
-  East  -> Pos (x+1, y)
-  West  -> Pos (x-1, y)
-
-
-showGrid :: IGrid -> LT.Text
-showGrid arr = TB.toLazyTextWith (rangeSize ((0,0),(x,y))) builder
-  where tileToChar Dirt = '-'
-        tileToChar Empty = ' '
-        tileToChar Wall = '#'
-        tileToChar (Solid Entry) = '?'
-        tileToChar (Solid Exit) = '+'
-        tileToChar (Solid _) = '!'
-        (_,(x,y)) = bounds arr
-        builder = mconcat [mconcat chars <> TB.singleton '\n'
-                          | x' <- [0..x]
-                          , let chars = [TB.singleton . tileToChar $ arr ! (x', y')
-                                        | y' <- [0..y]]]
-
-
-printGrid :: IGrid -> IO ()
-printGrid arr = LTIO.putStr (showGrid arr)
-
--- | Choose a random element out of a list
-chooseL :: RandomGen g => g -> [a] -> a
-chooseL g list = list !! index
-  where index = fst (randomR (0, len) g)
-        len = (length list) - 1
-
--- | Infinite list of generators
-splits :: RandomGen g => g -> [g]
-splits g = let (g', gs) = split g
-           in g':splits gs
