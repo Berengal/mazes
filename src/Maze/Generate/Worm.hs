@@ -138,7 +138,9 @@ data Worm = Worm Int Position Direction
 
 instance Ord Worm where
   compare (Worm pri1 pos1 dir1) (Worm pri2 pos2 dir2)
-    = compare pri1 pri2 <> compare pos1 pos2 <> compare dir1 dir2
+    =  compare pri1 pri2
+    <> compare pos1 pos2
+    <> compare dir1 dir2
 
 -- | Position of worms and tiles in the maze. (0,0) is at the top left
 -- corner. The x axis grows to the right and the y axis grows downwards.
@@ -314,7 +316,9 @@ step g BurrowConfig{..} grid =
                | otherwise = 0
         oldWorm@(Worm pri oldPos oldDir) = S.elemAt wormIx worms
         noWormSet = worms \\ S.singleton oldWorm
-        deadWormSet = Just noWormSet
+        deadWormSet = Just (S.mapMonotonic
+                            (\(Worm pri pos dir) -> Worm (pri-1) pos dir)
+                            noWormSet)
         
         newPos@(Pos (x, y)) = moveInDir oldPos oldDir -- TODO bounds checking?
 
