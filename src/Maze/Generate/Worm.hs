@@ -96,8 +96,8 @@ import Control.Monad.ST
 import Data.Array.ST
 import Data.Array.IArray
 
-import qualified Data.Set as S
-import Data.Set ((\\))
+import qualified Data.Sequence as S
+import Data.Sequence (Seq((:<|), (:|>)))
 import Data.List (sort, group)
 
 import Data.Maybe
@@ -116,6 +116,7 @@ defaultBurrowConfig size = BurrowConfig {..}
         respawnWorms = True
         fillLeftoverDirt = True
         randomWormSelection = True
+        avoidWalls = True
 
 -- Predicate determining if a wall should be breached
 breachWall :: (RandomGen g)
@@ -150,14 +151,13 @@ turn turnChance g currentDir preferedDirs
 spawnWorm :: (RandomGen g)
           => Double -- ^ Spawn chance
           -> g -- ^ RNG
-          -> Int -- ^ Priority
           -> Position -- ^ Spawn position
           -> [Direction] -- ^ Possible spawn directions
           -> Maybe Worm -- ^ Spawned worm (or not)
-spawnWorm spawnChance g pri pos dirs =
+spawnWorm spawnChance g pos dirs =
   let (r, g1) = random g
   in if not (null dirs) && r < spawnChance then
-       Just (Worm pri pos (chooseL g1 dirs))
+       Just (Worm pos (chooseL g1 dirs))
      else
        Nothing
 
@@ -201,51 +201,49 @@ step :: forall s g. (RandomGen g)
      => g
      -> BurrowConfig
      -> Grid s
-     -> ST s (Maybe (S.Set Worm))
-step g BurrowConfig{..} grid =
-  if | S.null worms && respawnWorms -> do
-         (min, max) <- getBounds grid
-         let startPos = fst $ randomR (Pos min, Pos max) g
-         wormParams <- getNewWormParameters grid (startPos)
-         case wormParams of
-           Nothing -> return Nothing
-           Just (pos, dir) -> do
-             writeArray grid (unPos pos) Empty
-             return $ Just (S.singleton (Worm 0 pos dir))
+     -> ST s (Maybe (S.Seq Worm))
+step g BurrowConfig{..} grid
+  | S.null worms && respawnWorms = do
+      (min, max) <- getBounds grid
+      let startPos = fst $ randomR (Pos min, Pos max) g
+      wormParams <- getNewWormParameters grid (startPos)
+      case wormParams of
+        Nothing -> return Nothing
+        Just (pos, dir) -> do
+          writeArray grid (unPos pos) Empty
+          return $ Just (S.singleton (Worm pos dir))
              
-     | S.null worms && not respawnWorms ->
-         return Nothing
+  | S.null worms && not respawnWorms = return Nothing
          
-     | otherwise -> do
-         tile <- getTileInFront grid oldWorm
-         case tile of
-           Solid _ -> return deadWormSet
-           Empty   -> return deadWormSet
+  | otherwise = do
+      tile <- getTileInFront grid oldWorm
+      case tile of
+        Solid _ -> return deadWormSet
+        Empty   -> return deadWormSet
 
-           Wall    -> if not (breachWall breachWallChance dieG) then
-                        return deadWormSet
-                      else moveWorm
+        Wall    -> if not (breachWall breachWallChance dieG) then
+                     return deadWormSet
+                   else moveWorm
 
-           Dirt    -> moveWorm
+        Dirt    -> moveWorm
                                        
     
   where wormG:dieG:turnG:spawnG:_ = splits g
   
-        wormIx | randomWormSelection = fst $ randomR (0, S.size worms - 1) wormG
-               | otherwise = 0
-        oldWorm@(Worm pri oldPos oldDir) = S.elemAt wormIx worms
-        noWormSet = worms \\ S.singleton oldWorm
-        deadWormSet = Just (S.mapMonotonic
-                            (\(Worm pri pos dir) -> Worm (pri-1) pos dir)
-                            noWormSet)
+        wormIx = if randomWormSelection then
+                   fst $ randomR (0, S.length worms - 1) wormG
+                 else 0
+        oldWorm@(Worm oldPos oldDir) = S.index worms wormIx
+        noWormSet = S.deleteAt wormIx worms
+        deadWormSet = Just noWormSet
         
         newPos@(Pos (x, y)) = moveInDir oldPos oldDir -- TODO bounds checking?
 
         moveWorm = do dirtDirections <- getDirtDirections grid newPos
-                      tileInFront <- getTileInFront grid (Worm 0 newPos oldDir)
+                      tileInFront <- getTileInFront grid (Worm newPos oldDir)
                       updateGrid dirtDirections tileInFront
 
-        updateGrid :: [Direction] -> Tile -> ST s (Maybe (S.Set Worm))
+        updateGrid :: [Direction] -> Tile -> ST s (Maybe (S.Seq Worm))
         updateGrid dirtDirections tileInFront = do
           writeArray grid (x, y) Empty
           forM_ (neighbors newPos) \neighbor ->
@@ -262,19 +260,20 @@ step g BurrowConfig{..} grid =
           
           where
             preferedDirs = if null dirtDirections then directions else dirtDirections
-            newDir = turn (if tileInFront == Dirt then turnChance else 1) turnG oldDir preferedDirs
-            newWorm = Worm pri newPos newDir
+            turnChance' = if avoidWalls && tileInFront == Dirt
+                          then turnChance else 1
+            newDir = turn turnChance' turnG oldDir preferedDirs
+            newWorm = Worm newPos newDir
             spawnedWorm = spawnWorm
                           spawnChance
                           wormG
-                          (S.size worms)
                           newPos
                           (filter (/= newDir) preferedDirs)
         
-            movedWormSet = S.insert newWorm noWormSet
+            movedWormSet = newWorm :<| noWormSet
             spawnedWormSet = Just case spawnedWorm of
                                Nothing -> movedWormSet
-                               Just w -> S.insert w movedWormSet
+                               Just w ->  movedWormSet :|> w
 
 -- | The list of 'Direction's that point to tiles with 'Dirt' from the given 'Position'
 getDirtDirections :: Grid s -> Position -> ST s [Direction]
@@ -418,16 +417,16 @@ randomWormInBounds g bnds = randomWorm g
 
 randomWorm :: RandomGen g => g -> [(Position, Direction)] -> Maybe Worm
 randomWorm _ [] = Nothing
-randomWorm g opts = Just . uncurry (Worm 0) . chooseL g $ opts
+randomWorm g opts = Just . uncurry Worm  . chooseL g $ opts
 
 -- | Determines if the position is directly in front of the worm
 isTileInFrontOf :: Worm -> Position -> Bool
-isTileInFrontOf (Worm _ wormPos wormDir) pos
+isTileInFrontOf (Worm wormPos wormDir) pos
   = pos == moveInDir wormPos wormDir
 
 -- | Looks up the tile in front of the worm
 getTileInFront :: Grid s -> Worm -> ST s Tile
-getTileInFront grid (Worm _ pos dir) = do
+getTileInFront grid (Worm pos dir) = do
   bounds <- getBounds grid
   let (Pos (x, y)) = moveInDir pos dir
   readArray grid (x, y)

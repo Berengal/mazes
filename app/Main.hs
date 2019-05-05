@@ -4,9 +4,9 @@ import Maze.Generate.Worm
 import Maze.Picture
 import System.Random
 import Codec.Picture.Png
-import qualified Data.Set as S
+import qualified Data.Sequence as S
 
-size = (1000, 1000)
+size = (500, 500)
 scale = 1
 
 main :: IO ()
@@ -18,19 +18,20 @@ main = do
 
 config = BurrowConfig
   { gridSize = size
-  , worms = S.empty
-  , turnChance = 0.12
+  , worms = S.Empty
+  , turnChance = 0.02
   , breachWallChance = 0.00
   , spawnChance = 0.005
   , avoidSquares = True
   , respawnWorms = True
   , fillLeftoverDirt = False
   , randomWormSelection = False
+  , avoidWalls = False
   }
 
 organic = BurrowConfig
   { gridSize = size
-  , worms = S.empty
+  , worms = S.Empty
   , turnChance = 0.90
   , breachWallChance = 0.00
   , spawnChance = 0.10
@@ -38,6 +39,7 @@ organic = BurrowConfig
   , respawnWorms = False
   , fillLeftoverDirt = False
   , randomWormSelection = False
+  , avoidWalls = True
   }
 
 gnarly = BurrowConfig
@@ -50,6 +52,7 @@ gnarly = BurrowConfig
   , respawnWorms = False
   , fillLeftoverDirt = False
   , randomWormSelection = False
+  , avoidWalls = True
   }
 
 noisy = BurrowConfig
@@ -62,6 +65,7 @@ noisy = BurrowConfig
   , respawnWorms = True
   , fillLeftoverDirt = False
   , randomWormSelection = True
+  , avoidWalls = True
   }
 
 highlyRegular = BurrowConfig
@@ -74,4 +78,5 @@ highlyRegular = BurrowConfig
   , respawnWorms = True
   , fillLeftoverDirt = False
   , randomWormSelection = False
+  , avoidWalls = True
   }

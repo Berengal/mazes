@@ -5,7 +5,7 @@ import System.Random
 import Data.Array.ST
 import Data.Array.IArray
 
-import qualified Data.Set as S
+import qualified Data.Sequence as S
 
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as LT
@@ -19,7 +19,7 @@ data BurrowConfig = BurrowConfig
   { gridSize :: (Int, Int) -- ^ The internal size of the grid
      
 --     , grid :: Grid s -- ^ The maze grid  
-  , worms :: S.Set Worm -- ^ The set of active worms on the grid
+  , worms :: S.Seq Worm -- ^ The set of active worms on the grid
   , avoidSquares :: Bool -- ^ Use extra logic to avoid 2x2 squares
   , respawnWorms :: Bool -- ^ Spawn new worms if there still dirt tiles with no
                    -- live worms
@@ -27,6 +27,7 @@ data BurrowConfig = BurrowConfig
                         -- algorithm is done
   , randomWormSelection :: Bool -- ^ Select a new random worm after each
                            -- generation step
+  , avoidWalls :: Bool -- ^ Always turn to avoid walls
   , breachWallChance :: Double -- ^ Chance that a worm will breach a wall
                                -- (between 0 and 1)
   , turnChance :: Double -- ^ Chance that a worm won't just continue straight
@@ -39,15 +40,9 @@ type Grid s = STArray s GridCoord Tile
 -- | Immutable maze grid
 type IGrid = Array GridCoord Tile
 
--- | Worms burrow through the maze. Each has a priority, a position and a direction
-data Worm = Worm Int Position Direction
-  deriving (Eq, Show)
-
-instance Ord Worm where
-  compare (Worm pri1 pos1 dir1) (Worm pri2 pos2 dir2)
-    =  compare pri1 pri2
-    <> compare pos1 pos2
-    <> compare dir1 dir2
+-- | Worms burrow through the maze. Each has a position and a direction
+data Worm = Worm Position Direction
+  deriving (Eq, Ord, Show)
 
 -- | Position of worms and tiles in the maze. (0,0) is at the top left
 -- corner. The x axis grows to the right and the y axis grows downwards.
@@ -65,7 +60,7 @@ instance Random Position where
   randomR (Pos (minX, minY), Pos (maxX, maxY)) g
     = let (x, g') = randomR (minX, maxX) g
           (y, g'') = randomR (minY, maxY) g'
-      in (Pos (x,y), g'')               
+      in (Pos (x,y), g'')
 
 -- | One of the four compas directions. In a (x, y) coordinate system, going
 -- `South` means increasing y component, going `East` means increasing x
@@ -97,7 +92,6 @@ data TileAnnotation
   | Entry -- ^ A maze entrance tile
   | Exit -- ^ A maze exit tile
   deriving (Show, Eq, Ord)
-
 
 type GridCoord = (Int, Int)
 type GridBounds = (GridCoord, GridCoord)
